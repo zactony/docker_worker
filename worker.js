@@ -1,87 +1,211 @@
-import HTML from './docker.html';
+function logError(request, message) {
+  console.error(
+    `${message}, clientIp: ${request.headers.get(
+      "cf-connecting-ip"
+    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
+  );
+}
 
-export default {
-  async fetch(request) {
-    const url = new URL(request.url);
-    const host = request.headers.get("host");
-    
-    const registryHost = "registry-1.docker.io";
-    const authHost = "auth.docker.io";
-    const productionHost = "production.cloudflare.docker.com";
-
-    // 处理认证请求
-    if (url.pathname.startsWith('/token')) {
-      const headers = new Headers(request.headers);
-      headers.set('host', authHost);
-      
-      const authUrl = `https://${authHost}${url.pathname}${url.search}`;
-      const authRequest = new Request(authUrl, {
-        method: request.method,
-        headers: headers,
-        body: request.body,
-        redirect: "follow",
-      });
-
-      const response = await fetch(authRequest);
-      const responseHeaders = new Headers(response.headers);
-      responseHeaders.set('access-control-allow-origin', host);
-      responseHeaders.set('access-control-allow-headers', 'Authorization');
-      
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
-      });
+function createNewRequest(request, url, proxyHostname, originHostname) {
+  const newRequestHeaders = new Headers(request.headers);
+  for (const [key, value] of newRequestHeaders) {
+    if (value.includes(originHostname)) {
+      newRequestHeaders.set(
+        key,
+        value.replace(
+          new RegExp(`(?<!\\.)\\b${originHostname}\\b`, "g"),
+          proxyHostname
+        )
+      );
     }
-    
-    // 处理 registry v2 请求
-    if (url.pathname.startsWith('/v2/')) {
-      const headers = new Headers(request.headers);
-      headers.set('host', registryHost);
-      
-      const registryUrl = `https://${registryHost}${url.pathname}${url.search}`;
-      const registryRequest = new Request(registryUrl, {
-        method: request.method,
-        headers: headers,
-        body: request.body,
-        redirect: "follow",
-      });
+  }
+  return new Request(url.toString(), {
+    method: request.method,
+    headers: newRequestHeaders,
+    body: request.body,
+  });
+}
 
-      const response = await fetch(registryRequest);
-      const responseHeaders = new Headers(response.headers);
-      responseHeaders.set('access-control-allow-origin', host);
-      responseHeaders.set('access-control-allow-headers', 'Authorization');
-
-      // 修改认证头，将认证请求指向主域名
-      const wwwAuth = responseHeaders.get('www-authenticate');
-      if (wwwAuth) {
-        const newWwwAuth = wwwAuth
-          .replace('https://auth.docker.io', `https://${host}`)
-          .replace('https://auth.hub.docker.com', `https://${host}`);
-        responseHeaders.set('www-authenticate', newWwwAuth);
-      }
-
-      // 修改重定向地址
-      const location = responseHeaders.get('location');
-      if (location) {
-        const newLocation = location
-          .replace('https://production.cloudflare.docker.com', `https://${host}`);
-        responseHeaders.set('location', newLocation);
-      }
-
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
-      });
+function setResponseHeaders(
+  originalResponse,
+  proxyHostname,
+  originHostname,
+  DEBUG
+) {
+  const newResponseHeaders = new Headers(originalResponse.headers);
+  for (const [key, value] of newResponseHeaders) {
+    if (value.includes(proxyHostname)) {
+      newResponseHeaders.set(
+        key,
+        value.replace(
+          new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
+          originHostname
+        )
+      );
     }
+  }
+  if (DEBUG) {
+    newResponseHeaders.delete("content-security-policy");
+  }
+  let docker_auth_url = newResponseHeaders.get("www-authenticate");
+  if (docker_auth_url && docker_auth_url.includes("auth.docker.io/token")) {
+    newResponseHeaders.set(
+      "www-authenticate",
+      docker_auth_url.replace("auth.docker.io/token", originHostname + "/token")
+    );
+  }
+  return newResponseHeaders;
+}
 
-    // 处理默认请求
-    return new Response(HTML.replace(/{{host}}/g, host), {
-      status: 200,
-      headers: {
-        "content-type": "text/html"
-      }
-    });
+/**
+ * 替换内容
+ * @param originalResponse 响应
+ * @param proxyHostname 代理地址 hostname
+ * @param pathnameRegex 代理地址路径匹配的正则表达式
+ * @param originHostname 替换的字符串
+ * @returns {Promise<*>}
+ */
+async function replaceResponseText(
+  originalResponse,
+  proxyHostname,
+  pathnameRegex,
+  originHostname
+) {
+  let text = await originalResponse.text();
+  if (pathnameRegex) {
+    pathnameRegex = pathnameRegex.replace(/^\^/, "");
+    return text.replace(
+      new RegExp(`((?<!\\.)\\b${proxyHostname}\\b)(${pathnameRegex})`, "g"),
+      `${originHostname}$2`
+    );
+  } else {
+    return text.replace(
+      new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
+      originHostname
+    );
   }
 }
+
+async function nginx() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      let {
+        PROXY_HOSTNAME = "registry-1.docker.io",
+        PROXY_PROTOCOL = "https",
+        PATHNAME_REGEX,
+        UA_WHITELIST_REGEX,
+        UA_BLACKLIST_REGEX,
+        URL302,
+        IP_WHITELIST_REGEX,
+        IP_BLACKLIST_REGEX,
+        REGION_WHITELIST_REGEX,
+        REGION_BLACKLIST_REGEX,
+        DEBUG = false,
+      } = env;
+      const url = new URL(request.url);
+      const originHostname = url.hostname;
+      if (url.pathname.includes("/token")) {
+        PROXY_HOSTNAME = "auth.docker.io";
+      } else if (url.pathname.includes("/search")) {
+        PROXY_HOSTNAME = "index.docker.io";
+      }
+      if (
+        !PROXY_HOSTNAME ||
+        (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
+        (UA_WHITELIST_REGEX &&
+          !new RegExp(UA_WHITELIST_REGEX).test(
+            request.headers.get("user-agent").toLowerCase()
+          )) ||
+        (UA_BLACKLIST_REGEX &&
+          new RegExp(UA_BLACKLIST_REGEX).test(
+            request.headers.get("user-agent").toLowerCase()
+          )) ||
+        (IP_WHITELIST_REGEX &&
+          !new RegExp(IP_WHITELIST_REGEX).test(
+            request.headers.get("cf-connecting-ip")
+          )) ||
+        (IP_BLACKLIST_REGEX &&
+          new RegExp(IP_BLACKLIST_REGEX).test(
+            request.headers.get("cf-connecting-ip")
+          )) ||
+        (REGION_WHITELIST_REGEX &&
+          !new RegExp(REGION_WHITELIST_REGEX).test(
+            request.headers.get("cf-ipcountry")
+          )) ||
+        (REGION_BLACKLIST_REGEX &&
+          new RegExp(REGION_BLACKLIST_REGEX).test(
+            request.headers.get("cf-ipcountry")
+          ))
+      ) {
+        logError(request, "Invalid");
+        return URL302
+          ? Response.redirect(URL302, 302)
+          : new Response(await nginx(), {
+              headers: {
+                "Content-Type": "text/html; charset=utf-8",
+              },
+            });
+      }
+      url.host = PROXY_HOSTNAME;
+      url.protocol = PROXY_PROTOCOL;
+      const newRequest = createNewRequest(
+        request,
+        url,
+        PROXY_HOSTNAME,
+        originHostname
+      );
+      const originalResponse = await fetch(newRequest);
+      const newResponseHeaders = setResponseHeaders(
+        originalResponse,
+        PROXY_HOSTNAME,
+        originHostname,
+        DEBUG
+      );
+      const contentType = newResponseHeaders.get("content-type") || "";
+      let body;
+      if (contentType.includes("text/")) {
+        body = await replaceResponseText(
+          originalResponse,
+          PROXY_HOSTNAME,
+          PATHNAME_REGEX,
+          originHostname
+        );
+      } else {
+        body = originalResponse.body;
+      }
+      return new Response(body, {
+        status: originalResponse.status,
+        headers: newResponseHeaders,
+      });
+    } catch (error) {
+      logError(request, `Fetch error: ${error.message}`);
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  },
+};
